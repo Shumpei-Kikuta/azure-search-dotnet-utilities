@@ -460,68 +460,67 @@ class Program
         }
     }
 
-    static void WriteIndexDocuments(int documentCount)
+    tatic void WriteIndexDocuments(int documentCount)
+{
+    Console.WriteLine("\n Backing up source index documents to {0}*.json", Path.Combine(BackupDirectory, SourceIndexName));
+    
+    int fileCounter = 1;
+    int totalDocumentsProcessed = 0;
+    
+    // インデックスからドキュメントを取得して処理
+    try
     {
-        Console.WriteLine("\n Backing up source index documents to {0}*.json", Path.Combine(BackupDirectory, SourceIndexName));
-        
-        int fileCounter = 1;
-        int totalDocumentsProcessed = 0;
-        
-        // インデックスからドキュメントを取得して処理
-        try
+        while (totalDocumentsProcessed < documentCount)
         {
-            while (totalDocumentsProcessed < documentCount)
+            List<SearchDocument> batch = new List<SearchDocument>();
+            
+            // ドキュメントを取得
+            SearchOptions options = new SearchOptions
             {
-                List<SearchDocument> batch = new List<SearchDocument>();
-                
-                // ドキュメントを取得
-                SearchOptions options = new SearchOptions
-                {
-                    SearchMode = SearchMode.All,
-                    Skip = totalDocumentsProcessed,
-                    Size = MaxBatchSize
-                };
-                
-                SearchResults<SearchDocument> response = SourceSearchClient.Search<SearchDocument>("*", options);
-                foreach (SearchResult<SearchDocument> result in response.GetResults())
-                {
-                    batch.Add(result.Document);
-                }
-                
-                if (batch.Count == 0) break; // 全てのドキュメントを処理した
-                
-                totalDocumentsProcessed += batch.Count;
-                
-                // JSONファイルに書き込み
-                string json = string.Empty;
-                foreach (var doc in batch)
-                {
-                    json += JsonSerializer.Serialize(doc) + ",";
-                    json = json.Replace("\"Latitude\":", "\"type\": \"Point\", \"coordinates\": [");
-                    json = json.Replace("\"Longitude\":", "");
-                    json = json.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
-                    json += "\n";
-                }
-                
-                // ファイルに出力
-                if (batch.Count > 0)
-                {
-                    json = json.Substring(0, json.Length - 2); // 最後のカンマと改行を削除
-                    string fileName = Path.Combine(BackupDirectory, $"{SourceIndexName}{fileCounter}.json");
-                    File.WriteAllText(fileName, "{\"value\": [");
-                    File.AppendAllText(fileName, json);
-                    File.AppendAllText(fileName, "]}");
-                    fileCounter++;
-                }
-                
-                Console.WriteLine("  Progress: {0}/{1} documents", totalDocumentsProcessed, documentCount);
+                SearchMode = SearchMode.All,
+                Skip = totalDocumentsProcessed,
+                Size = MaxBatchSize
+            };
+            
+            SearchResults<SearchDocument> response = SourceSearchClient.Search<SearchDocument>("*", options);
+            foreach (SearchResult<SearchDocument> result in response.GetResults())
+            {
+                batch.Add(result.Document);
             }
             
-            Console.WriteLine("  Backup complete: {0} documents in {1} files", totalDocumentsProcessed, fileCounter - 1);
+            if (batch.Count == 0) break; // 全てのドキュメントを処理した
+            
+            totalDocumentsProcessed += batch.Count;
+            
+            // JSONファイルに書き込み
+            string json = string.Empty;
+            foreach (var doc in batch)
+            {
+                json += JsonSerializer.Serialize(doc) + ",";
+                json = json.Replace("\"Latitude\":", "\"type\": \"Point\", \"coordinates\": [");
+                json = json.Replace("\"Longitude\":", "");
+                json = json.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
+                json += "\n";
+            }
+            
+            // ファイルに出力
+            if (batch.Count > 0)
+            {
+                json = json.Substring(0, json.Length - 2); // 最後のカンマと改行を削除
+                string fileName = Path.Combine(BackupDirectory, $"{SourceIndexName}{fileCounter}.json");
+                File.WriteAllText(fileName, "{\"value\": [");
+                File.AppendAllText(fileName, json);
+                File.AppendAllText(fileName, "]}");
+                fileCounter++;
+            }
+            
+            Console.WriteLine("  Progress: {0}/{1} documents", totalDocumentsProcessed, documentCount);
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine("  Error: {0}", ex.Message);
-        }
+        
+        Console.WriteLine("  Backup complete: {0} documents in {1} files", totalDocumentsProcessed, fileCounter - 1);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("  Error: {0}", ex.Message);
     }
 }
