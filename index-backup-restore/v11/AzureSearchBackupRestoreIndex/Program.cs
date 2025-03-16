@@ -103,72 +103,215 @@ class Program
 
         // Extract the content to JSON files
         int SourceDocCount = GetCurrentDocCount(SourceSearchClient);
-        WriteIndexDocuments(SourceDocCount);     // Output content from index to json files
+        
+        // For indexes with more than 100,000 documents, use facets to divide and extract data
+        if (SourceDocCount > 100000)
+        {
+            Console.WriteLine("\n Index contains more than 100,000 documents ({0}). Using facet-based extraction.", SourceDocCount);
+            WriteIndexDocumentsUsingFacets();
+        }
+        else
+        {
+            WriteIndexDocuments(SourceDocCount);     // Output content from index to json files
+        }
     }
 
-    static void WriteIndexDocuments(int CurrentDocCount)
+    // Extract documents using facets to bypass the 100K limitation
+    static void WriteIndexDocumentsUsingFacets()
     {
-        // Write document files in batches (per MaxBatchSize) in parallel
-        int FileCounter = 0;
-        for (int batch = 0; batch <= (CurrentDocCount / MaxBatchSize); batch += ParallelizedJobs)
+
+        var schema = SourceIndexClient.GetIndex(SourceIndexName);
+        
+        // Find facetable fields that can be used to segment the documents
+        // Good facet fields typically have:
+        // 1. A reasonable number of distinct values (not too few, not too many)
+        // 2. Values that distribute documents somewhat evenly
+        // 3. String type or collections of strings are preferred
+        var facetableFields = schema.Value.Fields
+            .Where(f => f.IsFacetable == true && (f.Type == "Edm.String" || f.Type.StartsWith("Collection")))
+            .Select(f => f.Name)
+            .ToList();
+
+        if (!facetableFields.Any())
         {
-
-            List<Task> tasks = new List<Task>();
-            for (int job = 0; job < ParallelizedJobs; job++)
-            {
-                FileCounter++;
-                int fileCounter = FileCounter;
-                if ((fileCounter - 1) * MaxBatchSize < CurrentDocCount)
-                {
-                    Console.WriteLine(" Backing up source documents to {0} - (batch size = {1})", Path.Combine(BackupDirectory, SourceIndexName + fileCounter + ".json"), MaxBatchSize);
-
-                    tasks.Add(Task.Factory.StartNew(() =>
-                        ExportToJSON((fileCounter - 1) * MaxBatchSize, Path.Combine(BackupDirectory, $"{SourceIndexName}{fileCounter}.json"))
-                    ));
-                }
-
-            }
-            Task.WaitAll(tasks.ToArray());  // Wait for all the stored procs in the group to complete
+            Console.WriteLine(" Error: No facetable fields found in the index. Please select a field manually.");
+            return;
         }
 
-        return;
+        // Select the optimal facet field based on cardinality analysis
+        string selectedFacetField = SelectOptimalFacetField(facetableFields);
+        Console.WriteLine(" Using field '{0}' as the facet field for document extraction.", selectedFacetField);
+
+        // Get all facet values for the selected field
+        SearchOptions facetOptions = new SearchOptions
+        {
+            SearchMode = SearchMode.All,
+            Facets = { selectedFacetField },
+            Size = 0  // We only need facet information, not results
+        };
+
+        SearchResults<SearchDocument> facetResults = SourceSearchClient.Search<SearchDocument>("*", facetOptions);
+        var facetValues = facetResults.Facets[selectedFacetField].Select(f => f.Value?.ToString()).Where(v => !string.IsNullOrEmpty(v)).ToList();
+
+        Console.WriteLine(" Field '{0}' has {1} distinct values.", selectedFacetField, facetValues.Count);
+
+        // Handle null values separately as they require different filter syntax
+        facetValues.Add(null);
+
+        // Export documents for each facet value
+        int fileCounter = 0;
+        foreach (var facetValue in facetValues)
+        {
+            fileCounter++;
+            string filterExpression;
+            
+            if (facetValue == null)
+            {
+                filterExpression = $"{selectedFacetField} eq null";
+                Console.WriteLine(" Backing up documents with facet value: null");
+            }
+            else
+            {
+                filterExpression = $"{selectedFacetField} eq '{facetValue}'";
+                Console.WriteLine(" Backing up documents with facet value: '{0}'", facetValue);
+            }
+
+            string fileName = Path.Combine(BackupDirectory, $"{SourceIndexName}{fileCounter}.json");
+            ExportToJSONWithFilter(filterExpression, fileName);
+        }
     }
 
-    static void ExportToJSON(int Skip, string FileName)
+    // Helper method to select the optimal facet field based on cardinality and distribution
+    static string SelectOptimalFacetField(List<string> facetableFields)
     {
-        // Extract all the documents from the selected index to JSON files in batches of 500 docs / file
+        // Ideal facet field should have:
+        // 1. Enough distinct values to break data into manageable chunks (<100K docs per value)
+        // 2. Not too many values to avoid excessive processing
+        // 3. Even distribution of documents across values
+
+        Dictionary<string, (int valueCount, double evenness)> fieldScores = new Dictionary<string, (int valueCount, double evenness)>();
+        
+        foreach (var field in facetableFields)
+        {
+            SearchOptions facetOptions = new SearchOptions
+            {
+                SearchMode = SearchMode.All,
+                Facets = { $"{field},count:1000" }, // Try to get up to 1000 facet values for analysis
+                Size = 0
+            };
+
+            try
+            {
+                SearchResults<SearchDocument> facetResults = SourceSearchClient.Search<SearchDocument>("*", facetOptions);
+                var facetValues = facetResults.Facets[field];
+                
+                // Calculate the evenness of distribution (closer to 1.0 is more even)
+                double avgCount = facetValues.Sum(f => f.Count ?? 0) / (double)facetValues.Count;
+                double variance = facetValues.Sum(f => Math.Pow((f.Count ?? 0) - avgCount, 2)) / facetValues.Count;
+                double evenness = 1.0 / (1.0 + Math.Sqrt(variance) / avgCount);
+
+                fieldScores[field] = (facetValues.Count, evenness);
+                
+                Console.WriteLine(" Field '{0}' has {1} values with evenness score {2:F2}", 
+                    field, facetValues.Count, evenness);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(" Error analyzing field '{0}': {1}", field, ex.Message);
+            }
+        }
+
+        // Simple scoring: prefer fields with 10-100 distinct values and high evenness
+        string bestField = facetableFields.First();
+        double bestScore = 0;
+        
+        foreach (var kvp in fieldScores)
+        {
+            int valueCount = kvp.Value.valueCount;
+            double evenness = kvp.Value.evenness;
+            
+            // Penalty for too few or too many values
+            double cardinalityScore;
+            if (valueCount < 5) cardinalityScore = 0.3;
+            else if (valueCount <= 100) cardinalityScore = 1.0;
+            else if (valueCount <= 500) cardinalityScore = 0.7;
+            else cardinalityScore = 0.4;
+            
+            double score = cardinalityScore * evenness;
+            
+            Console.WriteLine(" Field '{0}' score: {1:F2}", kvp.Key, score);
+            
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestField = kvp.Key;
+            }
+        }
+        
+        Console.WriteLine(" Selected field '{0}' as optimal (score: {1:F2})", bestField, bestScore);
+        return bestField;
+    }
+
+    // Export documents to JSON using a filter expression
+    static void ExportToJSONWithFilter(string filterExpression, string fileName)
+    {
         string json = string.Empty;
+        List<SearchDocument> allDocuments = new List<SearchDocument>();
+
         try
         {
-            SearchOptions options = new SearchOptions()
+            SearchOptions options = new SearchOptions
             {
                 SearchMode = SearchMode.All,
                 Size = MaxBatchSize,
-                Skip = Skip
+                Filter = filterExpression
             };
 
-            SearchResults<SearchDocument> response = SourceSearchClient.Search<SearchDocument>("*", options);
-
-            foreach (var doc in response.GetResults())
+            // Iterate through search results with the specified filter
+            int docCount = 0;
+            SearchResults<SearchDocument> response;
+            
+            do
             {
-                json += JsonSerializer.Serialize(doc.Document) + ",";
+                response = SourceSearchClient.Search<SearchDocument>("*", options);
+                var documents = response.GetResults().Select(r => r.Document).ToList();
+                allDocuments.AddRange(documents);
+                docCount += documents.Count;
+                options.Skip = (options.Skip ?? 0) + options.Size;
+                
+                Console.WriteLine("  Progress: Retrieved {0} documents", docCount);
+            } 
+            while (response.GetResults().Count > 0);
+
+            // Save all documents in JSON format
+            foreach (var doc in allDocuments)
+            {
+                json += JsonSerializer.Serialize(doc) + ",";
                 json = json.Replace("\"Latitude\":", "\"type\": \"Point\", \"coordinates\": [");
                 json = json.Replace("\"Longitude\":", "");
                 json = json.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
                 json += "\n";
             }
 
-            // Output the formatted content to a file
-            json = json.Substring(0, json.Length - 3); // remove trailing comma
-            File.WriteAllText(FileName, "{\"value\": [");
-            File.AppendAllText(FileName, json);
-            File.AppendAllText(FileName, "]}");
-            Console.WriteLine("  Total documents: {0}", response.GetResults().Count().ToString());
-            json = string.Empty;
+            if (allDocuments.Count > 0)
+            {
+                // Output the formatted content to a file
+                json = json.Substring(0, json.Length - 3); // remove trailing comma
+                File.WriteAllText(fileName, "{\"value\": [");
+                File.AppendAllText(fileName, json);
+                File.AppendAllText(fileName, "]}");
+                Console.WriteLine("  Total documents: {0}", allDocuments.Count);
+            }
+            else
+            {
+                // Create an empty JSON file
+                File.WriteAllText(fileName, "{\"value\": []}");
+                Console.WriteLine("  No documents found for this facet value");
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine("Error: {0}", ex.Message);
+            Console.WriteLine("  Error: {0}", ex.Message);
         }
     }
 
